@@ -1,0 +1,3 @@
+[submodule "vulkan-framework"]
+	path = vulkan-framework
+	url = git@github.com:TKristof09/vulkan-framework.git
