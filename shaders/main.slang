@@ -1,15 +1,13 @@
-#define NUM_STEPS 100000
-#define STEP_SIZE 0.001
-#define MAX_DISTANCE 1000
 #define HALF_PI 1.5707963267948966192313216916398
 
 RWTexture2D<float4> OutputTexture;
 SamplerCube Background;
 struct Camera
 {
-    float3 position;
     float vFOVRadians;
     float aspectRatio;
+    float angle;
+    float distance;
 }
 
 struct BlackholeParams
@@ -17,36 +15,47 @@ struct BlackholeParams
     float M;
 }
 
+struct SimulationParams
+{
+    int numSteps;
+    float stepSize;
+}
 uniform Camera camera;
 uniform float2 screenSize;
 uniform BlackholeParams bh;
+uniform SimulationParams simParams;
+
 
 float3 GetRayDir(float2 uv)
 {
-    float viewPortHeight = 2 * tan(camera.vFOVRadians * 0.5f);
+    float viewPortHeight = 2.0f * tan(camera.vFOVRadians * 0.5f);
     float viewPortWidth  = camera.aspectRatio * viewPortHeight;
 
-    float3 w = normalize(-camera.position);     // forward to origin
-    float3 u = normalize(cross(float3(0,1,0), w));
-    float3 v = cross(w, u);
+    // we consider camera fixed for the simulation on the +z axis facing the origin
+    float3 forward = float3(0, 0, -1);
+    float3 right   = float3(1, 0, 0);
+    float3 up      = float3(0, 1, 0);
 
-    float3 horizontal = viewPortWidth * u;
-    float3 vertical   = viewPortHeight * v;
-    float3 lowerLeft  = camera.position + w - horizontal*0.5f - vertical*0.5f;
+    float2 screenPos = uv - 0.5f;
 
-    float3 pointOnPlane = lowerLeft + uv.x * horizontal + uv.y * vertical;
-    return normalize(pointOnPlane - camera.position);
+    float3 dir = forward + screenPos.x * viewPortWidth * right + screenPos.y * viewPortHeight * up;
+
+    return normalize(dir);
 }
 
-float3x3 GetRotationMatrix(float alpha)
+float3x3 GetRotationMatrix(float alpha, float3 axis)
 {
     float c = cos(alpha);
     float s = sin(alpha);
+
+    float3 temp = (1 - c) * axis;
+
     return {
-        c, s, 0,
-       -s, c, 0,
-        0, 0, 1
+        axis.x * temp.x + c,            axis.x * temp.y + axis.z * s,   axis.x * temp.z - axis.y * s,
+        axis.x * temp.y - axis.z * s,   axis.y * temp.y + c,            axis.y * temp.z + axis.x * s,
+        axis.x * temp.z + axis.y * s,   axis.y * temp.z - axis.x * s,   axis.z * temp.z + c,
     };
+
 }
 
 float3 CartesianToPolar(float3 dir)
@@ -70,7 +79,7 @@ float3 PolarToCartesian(float3 v)
 
 float4 CalculateTetradMomentum(float3 n)
 {
-    float r = length(camera.position);
+    float r = camera.distance;
 
     float omega = 1.0;
     float p_t = omega / sqrt(1 - 2 * bh.M/r);
@@ -81,7 +90,7 @@ float4 CalculateTetradMomentum(float3 n)
 }
 float2 CalculateConstants(float4 momentum)
 {
-    float r = length(camera.position);
+    float r = camera.distance;
     float E = (1 - 2 * bh.M / r) * momentum.x;
     float L = r * r * momentum.w;
 
@@ -95,11 +104,12 @@ float4 CalcDerivatives(float4 state, float2 constants)
     const float E = constants.x;
     const float L = constants.y;
 
+    float inv_r = 1.0 / state.y;
 
-    float dt = E * 1.0 / (1.0 - 2.0 * bh.M / state.y);
+    float dt = E * 1.0 / (1.0 - 2.0 * bh.M * inv_r);
     float dr = state.z;
-    float dp_r = L * L * (state.y - 3.0 * bh.M) / (state.y * state.y * state.y * state.y);
-    float dphi = L / (state.y * state.y);
+    float dp_r = L * L * (state.y - 3.0 * bh.M) * inv_r * inv_r * inv_r * inv_r;
+    float dphi = L * inv_r * inv_r;
 
     return {dt, dr, dp_r, dphi};
 }
@@ -117,20 +127,25 @@ void main(uint3 DTid : SV_DispatchThreadID)
     float2 uv = (DTid.xy + 0.5) / screenSize;
 
     float3 dir = GetRayDir(uv);
-    
     // Rotate the coordinates around the z axis so that the ray lies in the equatorial plane theta = pi / 2
+    // We do the simulating while pretending that the camera is positioned always on the +z axis. 
+    // We only take into account camera rotation when sampling the background at the end,
+    // this way I don't have to deal with any complex rotations for the simulation and the end result should be the same
     float alpha = atan2(dir.y, dir.x);
-    float3x3 rot = GetRotationMatrix(alpha);
+    float3x3 rot = GetRotationMatrix(alpha, float3(0,0,1));
     dir = mul(rot, dir);
 
+    bad |= abs(dir.y) >= 0.0001;
 
-    float r0 = length(camera.position);
-    float phi0 = atan2(camera.position.z, camera.position.x);
+    const float r0 = camera.distance;
+    const float phi0 = HALF_PI; // camera always considered to be on +z axis, we do rotation at the end
 
+    // define axis of the local (cartesian) coordinate space near the camera. this is a locally flat space
     float3 e_r = {cos(phi0), 0, sin(phi0)};
     float3 e_theta = {0, 1, 0};
     float3 e_phi = {-sin(phi0), 0, cos(phi0)};
 
+    // project direction into the camera local coordinate system
     float n_r = dot(dir, e_r);
     float n_theta = dot(dir, e_theta);
     float n_phi = dot(dir, e_phi);
@@ -145,18 +160,23 @@ void main(uint3 DTid : SV_DispatchThreadID)
           momentum.y,
           phi0};
 
-    for(int i = 0; i < NUM_STEPS; i++)
+    for(int i = 0; i < simParams.numSteps; i++)
     {
         float4 derivatives = CalcDerivatives(state, constants);
-        state += derivatives * STEP_SIZE;
+        state += derivatives * simParams.stepSize;
 
         if(state.y <= 2 * bh.M)
         {
             OutputTexture[int2(DTid.xy)] = float4(0,0,0,1);
+
+            if(bad)
+            {
+                OutputTexture[int2(DTid.xy)] = float4(1.0, 0.0, 1.0, 1.0);
+            }
             return;
         }
 
-        if(state.y >= MAX_DISTANCE)
+        if(state.y >= max(camera.distance, bh.M * 10)) // ray goes out very far, no need to continue simulating
             break;
     }
 
@@ -171,8 +191,10 @@ void main(uint3 DTid : SV_DispatchThreadID)
         // Rotate the ray back into the original coordinate system
         dir = mul(transpose(rot), dir);
 
+        // Rotate the final direction to take into account the camera orbit angle
+        float3x3 cameraRot = GetRotationMatrix(camera.angle, float3(0, 1, 0));
+        dir = mul(cameraRot, dir);
         float4 color = Background.SampleLevel(dir, 0.0);
-        // color = float4(1,0,0,1);
 
         OutputTexture[int2(DTid.xy)] = color;
     }
