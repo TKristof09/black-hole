@@ -114,6 +114,16 @@ float4 CalcDerivatives(float4 state, float2 constants)
     return {dt, dr, dp_r, dphi};
 }
 
+float4 RK4(float4 state, float2 constants)
+{
+    float h = simParams.stepSize;
+    float4 k1 = CalcDerivatives(state, constants);
+    float4 k2 = CalcDerivatives(state + 0.5 * h * k1, constants);
+    float4 k3 = CalcDerivatives(state + 0.5 * h * k2, constants);
+    float4 k4 = CalcDerivatives(state + h * k3, constants);
+
+    return state + (h / 6.0) * (k1 + k2 * 2.0 + k3 * 2.0 + k4);
+}
 
 
 [shader("compute")]
@@ -162,8 +172,7 @@ void main(uint3 DTid : SV_DispatchThreadID)
 
     for(int i = 0; i < simParams.numSteps; i++)
     {
-        float4 derivatives = CalcDerivatives(state, constants);
-        state += derivatives * simParams.stepSize;
+        state = RK4(state, constants);
 
         if(state.y <= 2 * bh.M)
         {

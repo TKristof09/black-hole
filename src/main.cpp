@@ -21,11 +21,10 @@ int main()
 
     Image background = Image::CubemapFromFile("resources/milky_way_cubemap");
 
-    float distance   = 30.f;
-    float orbitAngle = 0.f;
+    float distance = 30.f;
 
-    int32_t simNumSteps = 1e4;
-    float simStepSize   = 1e-2;
+    int32_t simNumSteps = 2e3;
+    float simStepSize   = 5e-2;
 
     Shader& shader = p.GetShader(0);
 
