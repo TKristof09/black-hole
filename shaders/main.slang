@@ -1,29 +1,45 @@
 #define HALF_PI 1.5707963267948966192313216916398
+#define PI 3.1415926535897932384626433832795
+#define TWO_PI 6.283185307179586476925286766559
+
 
 RWTexture2D<float4> OutputTexture;
+RWTexture2D<float4> PauseTexture;
 SamplerCube Background;
 struct Camera
 {
     float vFOVRadians;
     float aspectRatio;
-    float angle;
+    float3 angle;
     float distance;
 }
 
 struct BlackholeParams
 {
     float M;
+    bool shouldRenderAccretionDisk;
+    float2 accretionDisk;
+    float accretionDiskHeight;
+    double temperatureConstant;
+    double temperatureScalar;
 }
 
 struct SimulationParams
 {
     int numSteps;
     float stepSize;
+    Sampler1D temperatureLUT;
+    float2 temperatureBounds;
+struct DebugParams
+{
+    bool eventHorizonGrid;
+    bool showAccretionDiskSides;
 }
 uniform Camera camera;
 uniform float2 screenSize;
 uniform BlackholeParams bh;
 uniform SimulationParams simParams;
+uniform DebugParams debug;
 
 
 float3 GetRayDir(float2 uv)
@@ -31,9 +47,9 @@ float3 GetRayDir(float2 uv)
     float viewPortHeight = 2.0f * tan(camera.vFOVRadians * 0.5f);
     float viewPortWidth  = camera.aspectRatio * viewPortHeight;
 
-    // we consider camera fixed for the simulation on the +z axis facing the origin
-    float3 forward = float3(0, 0, -1);
-    float3 right   = float3(1, 0, 0);
+    // we consider camera fixed for the simulation on the +x axis facing the origin
+    float3 forward = float3(-1, 0, 0);
+    float3 right   = float3(0, 0, 1);
     float3 up      = float3(0, 1, 0);
 
     float2 screenPos = uv - 0.5f;
@@ -125,6 +141,55 @@ float4 RK4(float4 state, float2 constants)
     return state + (h / 6.0) * (k1 + k2 * 2.0 + k3 * 2.0 + k4);
 }
 
+double GetDiskTemperature(float r)
+{
+    double radial = max((1.0 - sqrt(bh.accretionDisk.x / r)) / (r * r * r), 0.0001);
+    double t4 = bh.temperatureConstant * radial;
+
+    return sqrt(sqrt(t4));
+}
+
+float4 TemperatureToColor(float T)
+{
+    float u = (T - simParams.temperatureBounds.x) / (simParams.temperatureBounds.y - simParams.temperatureBounds.x);
+    u = saturate(u);
+    return simParams.temperatureLUT.SampleLevel(u, 0);
+}
+
+float4 SampleAccretionDisk(float r, float3 worldPosCartesian)
+{
+
+    float4 color;
+    if(!debug.showAccretionDiskSides)
+    {
+        float t = (float)GetDiskTemperature(r);
+        float4 hue = TemperatureToColor(t * (float)bh.temperatureScalar);
+        color = hue;
+    }
+    else
+    {
+        if(worldPosCartesian.y < 0)
+        {
+            color = float4(0.5,0.1,0,1);
+        }
+        else
+        {
+            color = float4(0.5,0.5,0,1);
+        }
+    }
+
+    return color;
+}
+float4 ToneMap(float4 color)
+{
+    return color;
+    return color / (color + 1.0);
+}
+#define OUTPUT(color) {\
+        float4 finalColor = ToneMap(color);\
+        OutputTexture[int2(DTid.xy)] = finalColor;\
+        PauseTexture[int2(DTid.xy)] = finalColor;\
+    }
 
 [shader("compute")]
 [numthreads(16,16,1)]
@@ -138,17 +203,22 @@ void main(uint3 DTid : SV_DispatchThreadID)
 
     float3 dir = GetRayDir(uv);
     // Rotate the coordinates around the z axis so that the ray lies in the equatorial plane theta = pi / 2
-    // We do the simulating while pretending that the camera is positioned always on the +z axis. 
+    // We do the simulating while pretending that the camera is positioned always on the +x axis. 
     // We only take into account camera rotation when sampling the background at the end,
     // this way I don't have to deal with any complex rotations for the simulation and the end result should be the same
-    float alpha = atan2(dir.y, dir.x);
-    float3x3 rot = GetRotationMatrix(alpha, float3(0,0,1));
+    float alpha = -atan2(dir.y, dir.z);
+    float3x3 rot = GetRotationMatrix(alpha, float3(1,0,0));
+    float3x3 cameraRot = 
+        mul(GetRotationMatrix(camera.angle.y, float3(0, 1, 0)),
+        mul(GetRotationMatrix(camera.angle.x, float3(1, 0, 0)),
+            GetRotationMatrix(camera.angle.z, float3(0, 0, 1))));
+    float3x3 combined_rot = mul(cameraRot, transpose(rot));
     dir = mul(rot, dir);
 
     bad |= abs(dir.y) >= 0.0001;
 
     const float r0 = camera.distance;
-    const float phi0 = HALF_PI; // camera always considered to be on +z axis, we do rotation at the end
+    const float phi0 = 0; // camera always considered to be on +x axis, we do rotation at the end
 
     // define axis of the local (cartesian) coordinate space near the camera. this is a locally flat space
     float3 e_r = {cos(phi0), 0, sin(phi0)};
@@ -170,20 +240,60 @@ void main(uint3 DTid : SV_DispatchThreadID)
           momentum.y,
           phi0};
 
+
     for(int i = 0; i < simParams.numSteps; i++)
     {
         state = RK4(state, constants);
 
+        float3 worldPosCartesian = mul(combined_rot, PolarToCartesian(float3(state.y, HALF_PI, state.w)));
+
+        if(bh.shouldRenderAccretionDisk)
+        {
+            if(abs(worldPosCartesian.y) <= bh.accretionDiskHeight && bh.accretionDisk.x * bh.M <= state.y && state.y <= bh.accretionDisk.y * bh.M)
+            {
+
+                float4 color = SampleAccretionDisk(state.y, worldPosCartesian);
+                OUTPUT(color);
+                return;
+            }
+        }
+
         if(state.y <= 2 * bh.M)
         {
-            OutputTexture[int2(DTid.xy)] = float4(0,0,0,1);
+            if(debug.eventHorizonGrid)
+            {
+                float3 coords = CartesianToPolar(normalize(mul(combined_rot, PolarToCartesian(float3(state.y, HALF_PI, state.w)))));
+
+                float u = (coords.z + PI) / TWO_PI;
+                float v = coords.y / PI;
+                float density = 10;
+                u *= density;
+                v *= density;
+
+                // Create the checkerboard pattern
+                float checker = (floor(u) + floor(v));
+
+                if (fmod(checker, 2.0) < 1.0){
+                    OUTPUT(float4(0,1,0,1));
+                }
+                else
+                {
+                    OUTPUT(float4(1,0,0,1));
+                }
+            }
+            else
+            {
+                OUTPUT(float4(0,0,0,1));
+            }
 
             if(bad)
             {
-                OutputTexture[int2(DTid.xy)] = float4(1.0, 0.0, 1.0, 1.0);
+                OUTPUT( float4(1.0, 0.0, 1.0, 1.0));
             }
             return;
         }
+
+
 
         if(state.y >= max(camera.distance, bh.M * 10)) // ray goes out very far, no need to continue simulating
             break;
@@ -198,13 +308,9 @@ void main(uint3 DTid : SV_DispatchThreadID)
     }
     else{
         // Rotate the ray back into the original coordinate system
-        dir = mul(transpose(rot), dir);
-
         // Rotate the final direction to take into account the camera orbit angle
-        float3x3 cameraRot = GetRotationMatrix(camera.angle, float3(0, 1, 0));
-        dir = mul(cameraRot, dir);
+        dir = mul(combined_rot, dir);
         float4 color = Background.SampleLevel(dir, 0.0);
-
-        OutputTexture[int2(DTid.xy)] = color;
+        OUTPUT(color);
     }
 }
