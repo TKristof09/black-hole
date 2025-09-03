@@ -2,7 +2,7 @@
 
 This project implements a GPU-based raytracer to simulate light propagation in Schwarzschild spacetime and render visualizations of a black hole.
 
-![Black hole render](screenshots/render.png)
+![Black hole render](screenshots/accretion_disk.png)
 
 # References    
 
